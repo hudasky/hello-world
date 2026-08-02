@@ -10,19 +10,19 @@ client=Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 SYSTEM =f"你是一个位于{os.getcwd()}的编码助手，使用bash来解决任务，直接执行，不要解释"
 TOOLS=[
     {
-    "name":"bash","description":"运行shell命令","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"requiered":["command"] }
+    "name":"bash","description":"运行shell命令","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"] }
     },
     {
-    "name":"read_file","description":"读取文件内容","input_schema":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"}},"requiered":["path"]}
+    "name":"read_file","description":"读取文件内容","input_schema":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"}},"required":["path"]}
     },
     {
-    "name":"write_file","description":"写入文件内容","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"requiered":["path","content"]}
+    "name":"write_file","description":"写入文件内容","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
     },
     {
-    "name":"edit_file","description":"替换文件中的文本","input_schema":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"requiered":["path","old_text","new_text"]}
+    "name":"edit_file","description":"替换文件中的文本","input_schema":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]}
     },
     {
-    "name":"glob","description":"查找匹配glob模式的文件","input_schema":{"type":"object","properties":{"pattern":{"type":"string"}},"requiered":["pattern"]}
+    "name":"glob","description":"查找匹配glob模式的文件","input_schema":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}
     },
     ]
 
@@ -88,6 +88,46 @@ TOOL_HANDLERS={
     "edit_file":run_edit,
     "glob":run_glob
 }
+DENY_LIST=["rm -rf /","sudo","shutdown","reboot","mkfs","> /dev/","of=/dev"]
+def check_deny_list(command:str)->str|None:
+    for deny in DENY_LIST:
+        if deny in command:
+            return "已阻止,该命令在deny_list中,属于危险命令!"
+    return None
+PERMSTION_RULES=[
+    {
+        "tools_names":["read_file","write_file","edit_file","glob"],
+        "check":lambda args:not (WORKDIR / args.get("path","")).resolve().is_relative_to(WORKDIR),
+        "message":"路径越界"
+    },
+    {
+        "tools_names":["bash"],
+        "check":lambda args:any(d in args.get("command","") for d in ["chmod 777","rm","> /etc/"]),
+        "message":"潜在的危险命令,请谨慎使用"
+    },
+]
+def check_rules(tool_name:str, args:dict)->str|None:
+    for rule in PERMSTION_RULES:
+        if tool_name in rule["tools_names"] and rule["check"](args):
+            return f"已阻止,原因: {rule['message']}"
+    return None
+def ask_user(tool_name:str, args:dict,reason:str)->bool:
+    print(f"\n⚠ {reason} ⚠")
+    print(f"工具: {tool_name}({args})")
+    choice=input("是否继续执行? (y/n): ").strip().lower()
+    return "allow" if choice=="y" else "deny"
+def check_permission(block)->str|None:
+    if block.name=="bash":
+        reason=check_deny_list(block.input.get("command",""))
+        if reason:
+            print(f"\n⛔{reason}")
+            return False
+    reason=check_rules(block.name,block.input)
+    if reason:
+        decision=ask_user(block.name,block.input,reason)
+        if decision=="deny":
+            return False
+    return True
 def agent_loop(messages:list):
     while True:
         response=client.messages.create(
@@ -102,12 +142,17 @@ def agent_loop(messages:list):
             return
         results=[]
         for block in response.content:
-            if block.type=="tool_use": 
-                print(f"\033[33m$ {block.name}\033[0m")
-                handler=TOOL_HANDLERS.get(block.name)
-                output=handler(**block.input) if handler else f"Error: 未知工具 {block.name}"
-                print(output[:200])
-                results.append({
+            if block.type!="tool_use": 
+                continue
+            print(f"\033[33m$ {block.name}\033[0m")
+            if not check_permission(block):
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": "Permission denied."})
+                continue
+            handler=TOOL_HANDLERS.get(block.name)
+            output=handler(**block.input) if handler else f"Error: 未知工具 {block.name}"
+            print(output[:200])
+            results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": output
